@@ -70,6 +70,8 @@ static int create_sock_handle(int family, int type, int protocol, bool is_nonblo
         case AF_INET6:
             sock->ops = &sock_ip_ops;
             break;
+        case AF_XDP:
+            sock->ops = &sock_xdp_ops;
     }
     int ret;
     if (!create_lock(&sock->lock) || !create_lock(&sock->recv_lock)) {
@@ -96,6 +98,7 @@ long shim_do_socket(int family, int type, int protocol) {
         case AF_UNIX:
         case AF_INET:
         case AF_INET6:
+        case AF_XDP:
             break;
         default:
             log_warning("%s: unsupported socket domain %d", __func__, family);
@@ -114,6 +117,12 @@ long shim_do_socket(int family, int type, int protocol) {
         case SOCK_STREAM:
         case SOCK_DGRAM:
             break;
+        case SOCK_RAW:
+            if (family == AF_XDP) {
+              break;
+            }
+            // otherwise SOCK_RAW is not supported in other socket families
+            // fall through
         default:
             log_warning("%s: unsupported socket type %d", __func__, type);
             return -EPROTONOSUPPORT;
@@ -330,6 +339,12 @@ long shim_do_listen(int fd, int backlog) {
 
     struct shim_sock_handle* sock = &handle->info.sock;
 
+    // xdp sockets does not support listen
+    // NOTE: this does not need a lock,,,, does it?
+    if (sock->domain == AF_XDP) {
+        return -EOPNOTSUPP;
+    }
+
     lock(&sock->lock);
 
     switch (sock->state) {
@@ -392,6 +407,12 @@ static int do_accept(int fd, void* addr, int* addrlen_ptr, int flags) {
     struct shim_handle* client_handle = NULL;
     bool has_recvtimeout_set = false;
     struct shim_sock_handle* sock = &handle->info.sock;
+
+    // xdp sockets does not support accept
+    // NOTE: this does not need a lock,,,, does it?
+    if (sock->domain == AF_XDP) {
+        return -EOPNOTSUPP;
+    }
 
     lock(&sock->lock);
     if (sock->state != SOCK_LISTENING) {
@@ -475,6 +496,11 @@ long shim_do_connect(int fd, void* addr, int _addrlen) {
 
     struct shim_sock_handle* sock = &handle->info.sock;
 
+    // xdp sockets does not support connect
+    // NOTE: this does not need a lock,,,, does it?
+    if (sock->domain == AF_XDP) {
+        return -EOPNOTSUPP;
+    }
     /* We need to take `recv_lock` just in case we free `peek` buffer in `disconnect` case.
      * This should not hurt though - nothing should be calling `recv` concurrently anyway. */
     lock(&sock->recv_lock);
@@ -607,8 +633,14 @@ ssize_t do_sendmsg(struct shim_handle* handle, struct iovec* iov, size_t iov_len
     if (handle->type != TYPE_SOCK) {
         return -ENOTSOCK;
     }
-    if (!WITHIN_MASK(flags, MSG_NOSIGNAL)) {
-        return -EOPNOTSUPP;
+    if (handle->info.sock.domain != AF_XDP) {
+        if (!WITHIN_MASK(flags, MSG_NOSIGNAL)) {
+            return -EOPNOTSUPP;
+        }
+    }else{
+        if (!WITHIN_MASK(flags, MSG_DONTWAIT)) {
+            return -EOPNOTSUPP;
+        }
     }
 
     struct shim_sock_handle* sock = &handle->info.sock;
@@ -1038,6 +1070,12 @@ long shim_do_shutdown(int fd, int how) {
     int ret;
     struct shim_sock_handle* sock = &handle->info.sock;
 
+    // xdp sockets does not support shutdown
+    // NOTE: this does not need a lock,,,, does it?
+    if (sock->domain == AF_XDP) {
+        return -EOPNOTSUPP;
+    }
+
     lock(&sock->lock);
 
     switch (sock->state) {
@@ -1121,6 +1159,12 @@ long shim_do_getsockname(int fd, void* addr, int* _addrlen) {
 
     struct shim_sock_handle* sock = &handle->info.sock;
 
+    // xdp sockets does not support getsockname
+    // NOTE: this does not need a lock,,,, does it?
+    if (sock->domain == AF_XDP) {
+        return -EOPNOTSUPP;
+    }
+
     lock(&sock->lock);
 
     /* If the user provided buffer is too small, the address is truncated, but we report the actual
@@ -1164,6 +1208,12 @@ long shim_do_getpeername(int fd, void* addr, int* _addrlen) {
 
     int ret;
     struct shim_sock_handle* sock = &handle->info.sock;
+
+    // xdp sockets does not support getpeername
+    // NOTE: this does not need a lock,,,, does it?
+    if (sock->domain == AF_XDP) {
+        return -EOPNOTSUPP;
+    }
 
     lock(&sock->lock);
 

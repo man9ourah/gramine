@@ -221,6 +221,7 @@ int ocall_mmap_untrusted(void** addrptr, size_t size, int prot, int flags, int f
     }
 
     void* returned_addr = READ_ONCE(ms->ms_addr);
+
     if (flags & MAP_FIXED) {
         /* addrptr already contains the mmap'ed address, no need to update it */
         if (returned_addr != requested_addr) {
@@ -1140,15 +1141,16 @@ int ocall_bind(int fd, struct sockaddr_storage* addr, size_t addrlen, uint16_t* 
         goto out;
     }
 
-    uint16_t new_port = READ_ONCE(ms->ms_new_port);
-    if (new_port == 0) {
-        ret = -EPERM;
-        goto out;
+    if (ms->ms_addr && ms->ms_addr->sa_family != AF_XDP) {
+        uint16_t new_port = READ_ONCE(ms->ms_new_port);
+        if (new_port == 0) {
+            ret = -EPERM;
+            goto out;
+        }
+        *out_new_port = new_port;
     }
 
-    *out_new_port = new_port;
     ret = 0;
-
 out:
     sgx_reset_ustack(old_ustack);
     return ret;
@@ -1511,6 +1513,26 @@ out:
     return retval;
 }
 
+ssize_t ocall_send_xdp(int sockfd) {
+    ssize_t retval = 0;
+    ms_ocall_send_xdp_t* ms;
+
+    void* old_ustack = sgx_prepare_ustack();
+
+    ms = sgx_alloc_on_ustack_aligned(sizeof(*ms), alignof(*ms));
+    if (!ms) {
+        retval = -EPERM;
+        goto out;
+    }
+
+    WRITE_ONCE(ms->ms_sockfd, sockfd);
+    retval = sgx_exitless_ocall(OCALL_SEND_XDP, ms);
+
+out:
+    sgx_reset_ustack(old_ustack);
+    return retval;
+}
+
 ssize_t ocall_send(int sockfd, const struct iovec* iov, size_t iov_len, const void* addr,
                    size_t addrlen, void* control, size_t controllen) {
     ssize_t retval = 0;
@@ -1585,6 +1607,68 @@ out:
     sgx_reset_ustack(old_ustack);
     if (is_obuf_mapped)
         ocall_munmap_untrusted_cache(obuf, ALLOC_ALIGN_UP(size), need_munmap);
+    return retval;
+}
+
+int ocall_getsockopt(int sockfd, int level, int optname, void* optval, size_t* optlen) {
+    int retval = 0;
+    ms_ocall_getsockopt_t* ms;
+
+    void* old_ustack = sgx_prepare_ustack();
+    ms = sgx_alloc_on_ustack_aligned(sizeof(*ms), alignof(*ms));
+    if (!ms) {
+        sgx_reset_ustack(old_ustack);
+        return -EPERM;
+    }
+
+    WRITE_ONCE(ms->ms_sockfd, sockfd);
+    WRITE_ONCE(ms->ms_level, level);
+    WRITE_ONCE(ms->ms_optname, optname);
+    WRITE_ONCE(ms->ms_optlen, NULL);
+    WRITE_ONCE(ms->ms_optval, NULL);
+
+    if (optlen) {
+        void* untrusted_optlen = sgx_copy_to_ustack(optlen, sizeof(*optlen));
+        if (!untrusted_optlen) {
+            sgx_reset_ustack(old_ustack);
+            return -EPERM;
+        }
+        WRITE_ONCE(ms->ms_optlen, untrusted_optlen);
+    }
+
+    if (optval && optlen && *optlen > 0) {
+        void* untrusted_optval = sgx_copy_to_ustack(optval, *optlen);
+        if (!untrusted_optval) {
+            sgx_reset_ustack(old_ustack);
+            return -EPERM;
+        }
+        WRITE_ONCE(ms->ms_optval, untrusted_optval);
+    }
+
+    do {
+        retval = sgx_exitless_ocall(OCALL_GETSOCKOPT, ms);
+    } while (retval == -EINTR);
+
+    if (retval < 0 && retval != -EBADF && retval != -EINVAL && retval != -ENOPROTOOPT &&
+            retval != -ENOTSOCK) {
+        retval = -EPERM;
+    }
+
+    if (optlen && ms->ms_optlen) {
+        if (!sgx_copy_to_enclave(optlen, sizeof(*optlen), READ_ONCE(ms->ms_optlen), sizeof(*ms->ms_optlen))) {
+            sgx_reset_ustack(old_ustack);
+            return -EPERM;
+        }
+    }
+
+    if (optval && ms->ms_optval && optlen && ms->ms_optlen && *ms->ms_optlen > 0) {
+        if (!sgx_copy_to_enclave(optval, *optlen, READ_ONCE(ms->ms_optval), *ms->ms_optlen)) {
+            sgx_reset_ustack(old_ustack);
+            return -EPERM;
+        }
+    }
+
+    sgx_reset_ustack(old_ustack);
     return retval;
 }
 

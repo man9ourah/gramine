@@ -29,6 +29,35 @@ static void signal_io(IDTYPE caller, void* arg) {
     }
 }
 
+/**
+ * searches for the interface index in the manifest
+ *
+ * @return 0 if interface index is not provided in manifest as 0 is an invalid index
+ */
+static int get_if_index(const char* ifname){
+    long ifindex = 0;
+    struct pal_public_state* pal_state = DkGetPalPublicState();
+    toml_table_t* manifest_root = pal_state->manifest_root;
+    assert(manifest_root);
+
+    toml_table_t* toml_sys_table = toml_table_in(manifest_root, "sys");
+    if (!toml_sys_table) {
+        return 0;
+    }
+    toml_table_t* toml_net_table = toml_table_in(toml_sys_table, "net");
+    if (!toml_net_table) {
+        return 0;
+    }
+    toml_raw_t toml_raw_ifindex = toml_raw_in(toml_net_table, ifname);
+    if (!toml_raw_ifindex) {
+        return 0;
+    }
+    if (toml_rtoi(toml_raw_ifindex, &ifindex) < 0){
+        return 0;
+    }
+    return ifindex;
+}
+
 long shim_do_ioctl(unsigned int fd, unsigned int cmd, unsigned long arg) {
     struct shim_handle* hdl = get_fd_handle(fd, NULL, NULL);
     if (!hdl)
@@ -109,6 +138,31 @@ long shim_do_ioctl(unsigned int fd, unsigned int cmd, unsigned long arg) {
             ret = 0;
             break;
         }
+        case SIOCGIFINDEX:;
+            if (!is_user_memory_readable((void*)arg, sizeof(struct ifreq)) ||
+                    !is_user_memory_writable((void*)arg, sizeof(struct ifreq))) {
+                ret = -EFAULT;
+                break;
+            }
+
+            struct ifreq* req = (struct ifreq*) arg;
+            const char* ifname = req->ifr_name;
+            int ifname_len = strnlen(ifname, IF_NAMESIZE);
+            if (ifname_len == IF_NAMESIZE || ifname_len == 0) {
+                ret = -EINVAL;
+                break;
+            }
+
+            // now we get the interface index from the manifest
+            int ifindex = get_if_index(ifname);
+            req->ifr_ifindex = ifindex;
+            if (ifindex == 0) {
+                ret = -ENODEV;
+                break;
+            }
+
+            ret = 0;
+            break;
         default:
             ret = -ENOSYS;
             break;

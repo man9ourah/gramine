@@ -42,6 +42,12 @@ enable_tests = get_option('tests') == 'enabled'
 
 enable_glibc = get_option('glibc') == 'enabled'
 enable_musl = get_option('musl') == 'enabled'
+enable_xdp = get_option('xdp') == 'enabled'
+
+enable_install_with_caps = enable_xdp and get_option('install_with_caps') == 'enabled'
+if enable_xdp and not enable_install_with_caps
+    warning('AF_XDP support is enabled but installing without needed CAP_NET_RAW')
+endif
 
 cc = meson.get_compiler('c')
 objcopy = find_program('objcopy')
@@ -315,6 +321,10 @@ endif
 
 if enable_libgomp
     subproject('gcc-10.2.0')
+endif
+
+if enable_xdp
+    subproject('xdp-tools-1.2.3')
 endif
 
 run_target('clang-format', command: [meson_clang_format_prog])

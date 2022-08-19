@@ -103,3 +103,9 @@ endif
 meson.add_install_script('/bin/sh', '-c',
     'ln -sf libpal.so "$MESON_INSTALL_DESTDIR_PREFIX"/@0@'.format(
         join_paths(pkglibdir, 'direct/loader')))
+
+if enable_install_with_caps
+    meson.add_install_script('/bin/sh', '-c',
+        'sudo setcap cap_net_raw,cap_sys_admin+eip "$MESON_INSTALL_DESTDIR_PREFIX"/@0@'.format(
+            join_paths(pkglibdir, 'direct/libpal.so')))
+endif

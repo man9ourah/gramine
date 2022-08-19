@@ -37,6 +37,17 @@ void pal_to_linux_sockaddr(const struct pal_socket_addr* pal_addr,
             memcpy(linux_addr, &sa_ipv6, sizeof(sa_ipv6));
             *linux_addr_len = sizeof(sa_ipv6);
             break;
+        case PAL_XDP:;
+            struct sockaddr_xdp sa_xdp = {
+                .sxdp_family = AF_XDP,
+                .sxdp_flags = pal_addr->xdp.flags,
+                .sxdp_ifindex = pal_addr->xdp.ifindex,
+                .sxdp_queue_id = pal_addr->xdp.queue_id,
+                .sxdp_shared_umem_fd = pal_addr->xdp.shared_umem_fd,
+            };
+            memcpy(linux_addr, &sa_xdp, sizeof(sa_xdp));
+            *linux_addr_len = sizeof(sa_xdp);
+            break;
         default:
             BUG();
     }
@@ -65,6 +76,15 @@ void linux_to_pal_sockaddr(const void* linux_addr, struct pal_socket_addr* pal_a
             static_assert(sizeof(pal_addr->ipv6.addr) == sizeof(sa_ipv6.sin6_addr.s6_addr), "ops");
             memcpy(pal_addr->ipv6.addr, sa_ipv6.sin6_addr.s6_addr, sizeof(pal_addr->ipv6.addr));
             pal_addr->ipv6.port = sa_ipv6.sin6_port;
+            break;
+        case AF_XDP:;
+            struct sockaddr_xdp sa_xdp;
+            memcpy(&sa_xdp, linux_addr, sizeof(sa_xdp));
+            pal_addr->domain = PAL_XDP;
+            pal_addr->xdp.flags = sa_xdp.sxdp_flags;
+            pal_addr->xdp.ifindex = sa_xdp.sxdp_ifindex;
+            pal_addr->xdp.queue_id = sa_xdp.sxdp_queue_id;
+            pal_addr->xdp.shared_umem_fd = sa_xdp.sxdp_shared_umem_fd;
             break;
         case AF_UNSPEC:
             pal_addr->domain = PAL_DISCONNECT;

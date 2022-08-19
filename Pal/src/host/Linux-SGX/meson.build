@@ -167,6 +167,12 @@ libpal_sgx_urts = executable('loader',
     install_dir: join_paths(pkglibdir, 'sgx'),
 )
 
+if enable_install_with_caps
+    meson.add_install_script('/bin/sh', '-c',
+        'sudo setcap cap_net_raw,cap_sys_admin+eip "$MESON_INSTALL_DESTDIR_PREFIX"/@0@'.format(
+            join_paths(pkglibdir, 'sgx/loader')))
+endif
+
 libpal_sgx_dep = declare_dependency(
     link_with: libpal_sgx,
     include_directories: includes_pal_common,

@@ -68,7 +68,11 @@ ssize_t ocall_recv(int sockfd, struct iovec* buf, size_t iov_len, void* addr, si
 ssize_t ocall_send(int sockfd, const struct iovec* iov, size_t iov_len, const void* addr,
                    size_t addrlen, void* control, size_t controllen);
 
+ssize_t ocall_send_xdp(int sockfd);
+
 int ocall_setsockopt(int sockfd, int level, int optname, const void* optval, size_t optlen);
+
+int ocall_getsockopt(int sockfd, int level, int optname, void* optval, size_t *optlen);
 
 int ocall_shutdown(int sockfd, int how);
 

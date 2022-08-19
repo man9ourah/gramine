@@ -108,8 +108,11 @@ struct shim_sock_ops {
 
 extern struct shim_sock_ops sock_unix_ops;
 extern struct shim_sock_ops sock_ip_ops;
+extern struct shim_sock_ops sock_xdp_ops;
 
 ssize_t do_recvmsg(struct shim_handle* handle, struct iovec* iov, size_t iov_len, void* addr,
                    size_t* addrlen, unsigned int* flags);
 ssize_t do_sendmsg(struct shim_handle* handle, struct iovec* iov, size_t iov_len, void* addr,
                    size_t addrlen, unsigned int flags);
+void* do_xdp_mmap(struct shim_handle* handle, void* addr, size_t size, int prot, int flags,
+                  uint64_t offset);

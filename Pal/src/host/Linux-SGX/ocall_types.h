@@ -58,7 +58,9 @@ enum {
     OCALL_CONNECT_SIMPLE,
     OCALL_RECV,
     OCALL_SEND,
+    OCALL_SEND_XDP,
     OCALL_SETSOCKOPT,
+    OCALL_GETSOCKOPT,
     OCALL_SHUTDOWN,
     OCALL_GETTIME,
     OCALL_SCHED_YIELD,
@@ -270,12 +272,24 @@ typedef struct {
 } ms_ocall_send_t;
 
 typedef struct {
+    PAL_IDX ms_sockfd;
+} ms_ocall_send_xdp_t;
+
+typedef struct {
     int ms_sockfd;
     int ms_level;
     int ms_optname;
     const void* ms_optval;
     size_t ms_optlen;
 } ms_ocall_setsockopt_t;
+
+typedef struct {
+    int ms_sockfd;
+    int ms_level;
+    int ms_optname;
+    void* ms_optval;
+    size_t* ms_optlen;
+} ms_ocall_getsockopt_t;
 
 typedef struct {
     int ms_sockfd;

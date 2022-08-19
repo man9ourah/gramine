@@ -146,6 +146,31 @@ static int checkin(struct shim_handle* handle) {
     return 0;
 }
 
+static int mmap(struct shim_handle* handle, void* addr, size_t size, int prot, int flags,
+            uint64_t offset){
+    // NOTE: do we need to lock sock here???? I dont think so
+    struct shim_sock_handle* sock = &handle->info.sock;
+    switch (sock->domain) {
+        case AF_XDP:;
+            void* mapped_address = do_xdp_mmap(handle, addr, size, prot, flags, offset);
+            if (addr != mapped_address) {
+                // our function *must* take a hint addr, but it was not respected.
+                // this is a problem because our vma will be totally confused
+                return -EPERM;
+            }
+            return 0;
+            break;
+
+        case AF_UNIX:
+        case AF_INET:
+        case AF_INET6:
+        default:
+            return -EBADF;
+    }
+
+    return -1;
+}
+
 static struct shim_fs_ops socket_fs_ops = {
     .close    = close,
     .read     = read,
@@ -156,6 +181,7 @@ static struct shim_fs_ops socket_fs_ops = {
     .setflags = setflags,
     .checkout = checkout,
     .checkin  = checkin,
+    .mmap     = mmap,
 };
 
 struct shim_fs socket_builtin_fs = {

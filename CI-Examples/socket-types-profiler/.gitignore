@@ -1,0 +1,7 @@
+perf-server
+perf-client
+.cache/
+compile_commands.json
+.project_root
+*.csv
+perf-xdp-loader

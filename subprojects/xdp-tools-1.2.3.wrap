@@ -1,0 +1,7 @@
+[wrap-file]
+directory = xdp-tools-1.2.3
+source_url = https://github.com/xdp-project/xdp-tools/releases/download/v1.2.3/xdp-tools-1.2.3.tar.gz
+; TODO: add fallback url
+source_filename = xdp-tools-1.2.3.tar.gz
+source_hash = 2607474911c005ea566ff96d4d77b2f5fa577526dd3e6d565eee7b5827107840
+patch_directory = xdp-tools

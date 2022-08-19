@@ -37,11 +37,13 @@ enum pal_socket_domain {
     PAL_DISCONNECT,
     PAL_IPV4,
     PAL_IPV6,
+    PAL_XDP,
 };
 
 enum pal_socket_type {
     PAL_SOCKET_TCP,
     PAL_SOCKET_UDP,
+    PAL_SOCKET_RAW,
 };
 
 #ifdef IN_PAL
@@ -412,6 +414,21 @@ int DkSendHandle(PAL_HANDLE target_process, PAL_HANDLE cargo);
  */
 int DkReceiveHandle(PAL_HANDLE source_process, PAL_HANDLE* out_cargo);
 
+enum pal_xdp_sockopt {
+    PAL_XDP_SETSOCKOPT_UMEM_REG,
+    PAL_XDP_SETSOCKOPT_FILL_RING,
+    PAL_XDP_SETSOCKOPT_COMP_RING,
+    PAL_XDP_SETSOCKOPT_TX_RING,
+    PAL_XDP_SETSOCKOPT_RX_RING,
+    PAL_XDP_GETSOCKOPT_MMAP_OFFSETS,
+    PAL_XDP_GETSOCKOPT_OPTIONS,
+    PAL_XDP_GETSOCKOPT_STATS,
+    PAL_XDP_MMAP_FILL_RING,
+    PAL_XDP_MMAP_COMP_RING,
+    PAL_XDP_MMAP_TX_RING,
+    PAL_XDP_MMAP_RX_RING,
+};
+
 // TODO: this needs to be redesigned, most of these fields are type specific
 /* stream attribute structure */
 typedef struct _PAL_STREAM_ATTR {
@@ -431,6 +448,46 @@ typedef struct _PAL_STREAM_ATTR {
             bool tcp_nodelay;
             bool ipv6_v6only;
         } socket;
+        // FIXME: should we create a new handle_type since we are adding a new union
+        // member? if this struct was checked against the handle_type for regular
+        // socket and it actually was a xdp socket it could be terrifying.
+        struct {
+            enum pal_xdp_sockopt sockopt;
+            // struct xdp_umem_reg for UMEM_REG
+            uint64_t umem_addr;
+            uint64_t umem_len;
+            uint32_t umem_chunk_size;
+            uint32_t umem_chunk_headroom;
+            uint32_t umem_flags;
+
+            // ring size for creating/mmaping rings
+            int ring_size;
+            // mmap flags for rings
+            int rings_mmap_flags;
+            // mmaped address / or hint
+            void* untrusted_ring_mapping;
+
+            // rings offsets
+            uint64_t fill_producer;
+            uint64_t fill_consumer;
+            uint64_t fill_desc;
+            uint64_t fill_flags;
+
+            uint64_t complete_producer;
+            uint64_t complete_consumer;
+            uint64_t complete_desc;
+            uint64_t complete_flags;
+
+            uint64_t tx_producer;
+            uint64_t tx_consumer;
+            uint64_t tx_desc;
+            uint64_t tx_flags;
+
+            uint64_t rx_producer;
+            uint64_t rx_consumer;
+            uint64_t rx_desc;
+            uint64_t rx_flags;
+        } xdp_socket;
     };
 } PAL_STREAM_ATTR;
 
@@ -479,6 +536,12 @@ struct pal_socket_addr {
             uint8_t addr[16];
             uint16_t port;
         } ipv6;
+        struct {
+          uint16_t flags;
+          uint32_t ifindex;
+          uint32_t queue_id;
+          uint32_t shared_umem_fd;
+        } xdp;
     };
 };
 

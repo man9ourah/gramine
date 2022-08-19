@@ -11,6 +11,11 @@ option('glibc', type: 'combo', choices: ['disabled', 'enabled'],
 option('musl', type: 'combo', choices: ['disabled', 'enabled'],
     value: 'enabled', description: 'Build patched musl')
 
+option('xdp', type: 'combo', choices: ['disabled', 'enabled'],
+    value: 'disabled', description: 'Include eXpress Data Path support. This needs CAP_NET_RAW.')
+option('install_with_caps', type: 'combo', choices: ['disabled', 'enabled'],
+    value: 'enabled', description: 'Installs gramine-direct & gramine-sgx with CAP_NET_RAW & CAP_SYS_ADMIN capabilities needed for AF_XDP sockets support. (can only be enabled with xdp enabled)')
+
 option('tests', type: 'combo', choices: ['disabled', 'enabled'],
     description: 'Build test binaries')
 

@@ -8,6 +8,7 @@
 #include <asm/mman.h>
 #include <asm/poll.h>
 #include <limits.h>
+#include <linux/bpf.h>
 #include <linux/futex.h>
 #include <linux/in.h>
 #include <linux/in6.h>
@@ -23,6 +24,7 @@
 #include "sgx_process.h"
 #include "sgx_tls.h"
 #include "sigset.h"
+#include "toml_utils.h"
 
 #define DEFAULT_BACKLOG 2048
 
@@ -339,6 +341,112 @@ static long sgx_ocall_socket(void* pms) {
     return DO_SYSCALL(socket, ms->ms_family, ms->ms_type | SOCK_CLOEXEC, ms->ms_protocol);
 }
 
+// following two functions adopted from linux kernel
+static int recv_xsks_map_fd_from_ctrl_node(int ctrl_sock_fd){
+	char cms[CMSG_SPACE(sizeof(int))];
+	struct cmsghdr *cmsg;
+	struct msghdr msg;
+	struct iovec iov;
+	int value;
+	int len;
+
+	iov.iov_base = &value;
+	iov.iov_len = sizeof(int);
+
+	msg.msg_name = 0;
+	msg.msg_namelen = 0;
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_flags = 0;
+	msg.msg_control = (void*)cms;
+	msg.msg_controllen = sizeof(cms);
+
+	len = DO_SYSCALL(recvmsg, ctrl_sock_fd, &msg, 0);
+
+	if (len <= 0) {
+        return -PAL_ERROR_CONNFAILED_PIPE;
+	}
+
+	cmsg = CMSG_FIRSTHDR(&msg);
+	int fd = *(int *)CMSG_DATA(cmsg);
+
+	return fd;
+}
+
+static int recv_xsks_map_fd(char* ctrl_server_path){
+	struct sockaddr_un server;
+	int ctrl_sock_fd;
+
+	ctrl_sock_fd = DO_SYSCALL(socket, AF_UNIX, SOCK_STREAM, 0);
+	if (ctrl_sock_fd < 0) {
+		return -PAL_ERROR_NOTCONNECTION;
+	}
+
+    memset(&server, 0, sizeof(server));
+    server.sun_family = AF_UNIX;
+
+    int unix_server_path_len = strnlen(ctrl_server_path, sizeof(server.sun_path));
+    if(unix_server_path_len == sizeof(server.sun_path)){
+        return -PAL_ERROR_ADDRNOTEXIST;
+    }
+    memcpy(server.sun_path, ctrl_server_path, unix_server_path_len);
+
+    int conn = DO_SYSCALL(connect, ctrl_sock_fd, (struct sockaddr *)&server, sizeof(struct sockaddr_un));
+	if (conn < 0) {
+        DO_SYSCALL(close, ctrl_sock_fd);
+        return -PAL_ERROR_NOTCONNECTION;
+	}
+
+	return recv_xsks_map_fd_from_ctrl_node(ctrl_sock_fd);
+}
+
+static int xdp_update_bpf_xsk_map(int xdp_sock_fd, int queue_id){
+    // first we need to get the xsk map from the control process.
+    // the user should have provide a unix socket addrees the control process
+    // is listening to; lets parse it
+    // TODO: it looks wrong to do the root parsing all over again here, find a better place for this
+    char errbuf[256];
+    toml_table_t*manifest_root = toml_parse(g_pal_enclave.raw_manifest_data, errbuf, sizeof(errbuf));
+    if (!manifest_root) {
+        log_error("PAL failed at parsing the manifest: %s", errbuf);
+        return -EINVAL;
+    }
+    toml_table_t* toml_sys_table = toml_table_in(manifest_root, "sys");
+    if (!toml_sys_table) {
+        return -PAL_ERROR_ADDRNOTEXIST;
+    }
+    toml_table_t* toml_net_table = toml_table_in(toml_sys_table, "net");
+    if (!toml_net_table) {
+        return -PAL_ERROR_ADDRNOTEXIST;
+    }
+    char* xdp_ctrl_server_path = NULL;
+    if (toml_string_in(toml_net_table, "xdp_ctrl_addr", &xdp_ctrl_server_path) < 0){
+        return -PAL_ERROR_ADDRNOTEXIST;
+    }
+
+    // now we attempt to connect to the ctrl process and get the bpf xsks map
+    int xsks_map_fd = recv_xsks_map_fd(xdp_ctrl_server_path);
+    if (xsks_map_fd < 0) {
+        return xsks_map_fd;
+    }
+
+    // we got the xsks map fd! now we insert our socket fd into the map
+    int sock_fd = xdp_sock_fd;
+    union bpf_attr bpfattr;
+    memset(&bpfattr, 0, sizeof(bpfattr));
+    bpfattr.map_fd = xsks_map_fd;
+    bpfattr.key = (__u64)(unsigned long)(&queue_id);
+    bpfattr.value = (__u64)(unsigned long)(&sock_fd);
+    bpfattr.flags = 0;
+
+    int ret = DO_SYSCALL(bpf, BPF_MAP_UPDATE_ELEM, &bpfattr, sizeof(bpfattr));
+    if (ret < 0) {
+        return -PAL_ERROR_DENIED;
+    }
+
+    return 0;
+}
+
 static long sgx_ocall_bind(void* pms) {
     ms_ocall_bind_t* ms = pms;
     int ret = DO_SYSCALL(bind, ms->ms_fd, ms->ms_addr, (int)ms->ms_addrlen);
@@ -346,24 +454,43 @@ static long sgx_ocall_bind(void* pms) {
         return ret;
     }
 
-    struct sockaddr_storage addr = { 0 };
-    int addrlen = sizeof(addr);
-    ret = DO_SYSCALL(getsockname, ms->ms_fd, &addr, &addrlen);
-    if (ret < 0) {
-        return ret;
+    if (!ms->ms_addr) {
+        return -EINVAL;
     }
 
-    switch (addr.ss_family) {
-        case AF_INET:
+    switch (ms->ms_addr->sa_family) {
+        case AF_INET:{
+            struct sockaddr_storage addr = { 0 };
+            int addrlen = sizeof(addr);
+            ret = DO_SYSCALL(getsockname, ms->ms_fd, &addr, &addrlen);
+            if (ret < 0) {
+                return ret;
+            }
             memcpy(&ms->ms_new_port, (char*)&addr + offsetof(struct sockaddr_in, sin_port),
                    sizeof(ms->ms_new_port));
             break;
-        case AF_INET6:
+        }
+        case AF_INET6:{
+            struct sockaddr_storage addr = { 0 };
+            int addrlen = sizeof(addr);
+            ret = DO_SYSCALL(getsockname, ms->ms_fd, &addr, &addrlen);
+            if (ret < 0) {
+                return ret;
+            }
             memcpy(&ms->ms_new_port, (char*)&addr + offsetof(struct sockaddr_in6, sin6_port),
                    sizeof(ms->ms_new_port));
             break;
+        }
+        case AF_XDP:{
+            struct sockaddr_xdp* addr = (struct sockaddr_xdp*)ms->ms_addr;
+            ret = xdp_update_bpf_xsk_map(ms->ms_fd, addr->sxdp_queue_id);
+            if (ret < 0) {
+                return ret;
+            }
+            break;
+        }
         default:
-            log_error("%s: unknown address family: %d", __func__, addr.ss_family);
+            log_error("%s: unknown address family: %d", __func__, ms->ms_addr->sa_family);
             DO_SYSCALL(exit_group, 1);
             die_or_inf_loop();
     }
@@ -627,6 +754,15 @@ static long sgx_ocall_send(void* pms) {
     return ret;
 }
 
+static long sgx_ocall_send_xdp(void* pms) {
+    ms_ocall_send_xdp_t* ms = (ms_ocall_send_xdp_t*)pms;
+    long ret;
+    ODEBUG(OCALL_SEND_XDP, ms);
+
+    ret = DO_SYSCALL(sendto, ms->ms_sockfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+    return ret;
+}
+
 static long sgx_ocall_setsockopt(void* pms) {
     ms_ocall_setsockopt_t* ms = (ms_ocall_setsockopt_t*)pms;
     long ret;
@@ -636,6 +772,18 @@ static long sgx_ocall_setsockopt(void* pms) {
     }
     ret = DO_SYSCALL(setsockopt, ms->ms_sockfd, ms->ms_level, ms->ms_optname, ms->ms_optval,
                      (int)ms->ms_optlen);
+    return ret;
+}
+
+static long sgx_ocall_getsockopt(void* pms) {
+    ms_ocall_getsockopt_t* ms = (ms_ocall_getsockopt_t*)pms;
+    long ret;
+    ODEBUG(OCALL_GETSOCKOPT, ms);
+    if (*ms->ms_optlen > INT_MAX) {
+        return -EINVAL;
+    }
+    ret = DO_SYSCALL(getsockopt, ms->ms_sockfd, ms->ms_level, ms->ms_optname, ms->ms_optval,
+                     ms->ms_optlen);
     return ret;
 }
 
@@ -803,7 +951,9 @@ sgx_ocall_fn_t ocall_table[OCALL_NR] = {
     [OCALL_CONNECT_SIMPLE]           = sgx_ocall_connect_simple,
     [OCALL_RECV]                     = sgx_ocall_recv,
     [OCALL_SEND]                     = sgx_ocall_send,
+    [OCALL_SEND_XDP]                 = sgx_ocall_send_xdp,
     [OCALL_SETSOCKOPT]               = sgx_ocall_setsockopt,
+    [OCALL_GETSOCKOPT]               = sgx_ocall_getsockopt,
     [OCALL_SHUTDOWN]                 = sgx_ocall_shutdown,
     [OCALL_GETTIME]                  = sgx_ocall_gettime,
     [OCALL_SCHED_YIELD]              = sgx_ocall_sched_yield,

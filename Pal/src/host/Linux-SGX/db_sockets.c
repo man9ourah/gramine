@@ -15,8 +15,10 @@
 
 static struct handle_ops g_tcp_handle_ops;
 static struct handle_ops g_udp_handle_ops;
+static struct handle_ops g_xdp_handle_ops;
 static struct socket_ops g_tcp_sock_ops;
 static struct socket_ops g_udp_sock_ops;
+static struct socket_ops g_xdp_sock_ops;
 
 /* Default values on a modern Linux kernel. */
 static size_t g_default_recv_buf_size = 0x20000;
@@ -73,6 +75,12 @@ static PAL_HANDLE create_sock_handle(int fd, enum pal_socket_domain domain,
     handle->sock.domain = domain;
     handle->sock.type = type;
     handle->sock.ops = ops;
+
+    // all of the next options does not apply to AF_XDP
+    if (handle->sock.domain == PAL_XDP) {
+        return handle;
+    }
+
     handle->sock.recv_buf_size = g_default_recv_buf_size;
     handle->sock.send_buf_size = g_default_send_buf_size;
     handle->sock.linger = 0;
@@ -99,6 +107,9 @@ int _DkSocketCreate(enum pal_socket_domain domain, enum pal_socket_type type,
         case PAL_IPV6:
             linux_domain = AF_INET6;
             break;
+        case PAL_XDP:
+            linux_domain = AF_XDP;
+            break;
         default:
             BUG();
     }
@@ -115,6 +126,15 @@ int _DkSocketCreate(enum pal_socket_domain domain, enum pal_socket_type type,
             handle_ops = &g_udp_handle_ops;
             sock_ops = &g_udp_sock_ops;
             break;
+        case PAL_SOCKET_RAW:
+            linux_type = SOCK_RAW;
+            if (domain == PAL_XDP) {
+                handle_ops = &g_xdp_handle_ops;
+                sock_ops = &g_xdp_sock_ops;
+                break;
+            }
+            // other than using xdp, SOCK_RAW is not supported yet!
+            // fall through
         default:
             BUG();
     }
@@ -179,6 +199,8 @@ static int bind(PAL_HANDLE handle, struct pal_socket_addr* addr) {
             if (!addr->ipv6.port) {
                 addr->ipv6.port = new_port;
             }
+            break;
+        case PAL_XDP:
             break;
         default:
             BUG();
@@ -258,6 +280,78 @@ static int connect(PAL_HANDLE handle, struct pal_socket_addr* addr,
     }
     return 0;
 }
+
+static int attrquerybyhdl_xdp(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) {
+    assert(PAL_GET_TYPE(handle) == PAL_TYPE_SOCKET);
+
+    switch (attr->xdp_socket.sockopt) {
+        case PAL_XDP_GETSOCKOPT_MMAP_OFFSETS:;
+            struct xdp_mmap_offsets xdp_off;
+            size_t len = sizeof(xdp_off);
+
+            int ret = ocall_getsockopt(handle->sock.fd, SOL_XDP, XDP_MMAP_OFFSETS, &xdp_off, &len);
+            if (ret < 0) {
+                return unix_to_pal_error(ret);
+            }
+
+            attr->xdp_socket.fill_producer     = xdp_off.fr.producer;
+            attr->xdp_socket.fill_consumer     = xdp_off.fr.consumer;
+            attr->xdp_socket.fill_desc         = xdp_off.fr.desc;
+            attr->xdp_socket.fill_flags        = xdp_off.fr.flags;
+            attr->xdp_socket.complete_producer = xdp_off.cr.producer;
+            attr->xdp_socket.complete_consumer = xdp_off.cr.consumer;
+            attr->xdp_socket.complete_desc     = xdp_off.cr.desc;
+            attr->xdp_socket.complete_flags    = xdp_off.cr.flags;
+            attr->xdp_socket.tx_producer       = xdp_off.tx.producer;
+            attr->xdp_socket.tx_consumer       = xdp_off.tx.consumer;
+            attr->xdp_socket.tx_desc           = xdp_off.tx.desc;
+            attr->xdp_socket.tx_flags          = xdp_off.tx.flags;
+            attr->xdp_socket.rx_producer       = xdp_off.rx.producer;
+            attr->xdp_socket.rx_consumer       = xdp_off.rx.consumer;
+            attr->xdp_socket.rx_desc           = xdp_off.rx.desc;
+            attr->xdp_socket.rx_flags          = xdp_off.rx.flags;
+            return ret;
+            break;
+        case PAL_XDP_MMAP_FILL_RING:
+            return ocall_mmap_untrusted(&attr->xdp_socket.untrusted_ring_mapping,
+                    attr->xdp_socket.ring_size, PROT_READ | PROT_WRITE,
+                    attr->xdp_socket.rings_mmap_flags,
+                    handle->sock.fd,
+                    XDP_UMEM_PGOFF_FILL_RING);
+            break;
+        case PAL_XDP_MMAP_COMP_RING:
+            return ocall_mmap_untrusted(&attr->xdp_socket.untrusted_ring_mapping,
+                    attr->xdp_socket.ring_size, PROT_READ | PROT_WRITE,
+                    attr->xdp_socket.rings_mmap_flags,
+                    handle->sock.fd,
+                    XDP_UMEM_PGOFF_COMPLETION_RING);
+            break;
+        case PAL_XDP_MMAP_TX_RING:
+            return ocall_mmap_untrusted(&attr->xdp_socket.untrusted_ring_mapping,
+                    attr->xdp_socket.ring_size, PROT_READ | PROT_WRITE,
+                    attr->xdp_socket.rings_mmap_flags,
+                    handle->sock.fd,
+                    XDP_PGOFF_TX_RING);
+            break;
+        case PAL_XDP_MMAP_RX_RING:
+            return ocall_mmap_untrusted(&attr->xdp_socket.untrusted_ring_mapping,
+                    attr->xdp_socket.ring_size, PROT_READ | PROT_WRITE,
+                    attr->xdp_socket.rings_mmap_flags,
+                    handle->sock.fd,
+                    XDP_PGOFF_RX_RING);
+            break;
+        case PAL_XDP_GETSOCKOPT_OPTIONS:
+        case PAL_XDP_GETSOCKOPT_STATS:
+            // TODO: we dont need those for now (for xdp init I mean)
+            return -PAL_ERROR_NOTIMPLEMENTED;
+            break;
+        default:
+            return -PAL_ERROR_INVAL;
+            break;
+    }
+
+    return -PAL_ERROR_INVAL;
+};
 
 static int attrquerybyhdl(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) {
     assert(PAL_GET_TYPE(handle) == PAL_TYPE_SOCKET);
@@ -424,10 +518,82 @@ static int attrsetbyhdl_tcp(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) {
     return 0;
 }
 
+static int attrsetbyhdl_xdp(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) {
+    assert(PAL_GET_TYPE(handle) == PAL_TYPE_SOCKET);
+    if (attr->handle_type != PAL_TYPE_SOCKET) {
+        return -PAL_ERROR_INVAL;
+    }
+
+    struct xdp_umem_reg mr;
+    int optname;
+    void* optval;
+    size_t optlen;
+
+    switch (attr->xdp_socket.sockopt) {
+        case PAL_XDP_SETSOCKOPT_UMEM_REG:;
+            mr.addr       = attr->xdp_socket.umem_addr;
+            mr.len        = attr->xdp_socket.umem_len;
+            mr.chunk_size = attr->xdp_socket.umem_chunk_size;
+            mr.headroom   = attr->xdp_socket.umem_chunk_headroom;
+            mr.flags      = attr->xdp_socket.umem_flags;
+
+            // umem memory must be outside the enclave
+            if(!sgx_is_completely_outside_enclave((const void*)mr.addr, mr.len)){
+                return -PAL_ERROR_INVAL;
+            }
+
+            optname = XDP_UMEM_REG;
+            optval = &mr;
+            optlen = sizeof(mr);
+            break;
+        case PAL_XDP_SETSOCKOPT_FILL_RING:;
+            optname = XDP_UMEM_FILL_RING;
+            optval = &attr->xdp_socket.ring_size;
+            optlen = sizeof(attr->xdp_socket.ring_size);
+            break;
+        case PAL_XDP_SETSOCKOPT_COMP_RING:;
+            optname = XDP_UMEM_COMPLETION_RING;
+            optval = &attr->xdp_socket.ring_size;
+            optlen = sizeof(attr->xdp_socket.ring_size);
+           break;
+        case PAL_XDP_SETSOCKOPT_TX_RING:;
+            optname = XDP_TX_RING;
+            optval = &attr->xdp_socket.ring_size;
+            optlen = sizeof(attr->xdp_socket.ring_size);
+           break;
+        case PAL_XDP_SETSOCKOPT_RX_RING:;
+            optname = XDP_RX_RING;
+            optval = &attr->xdp_socket.ring_size;
+            optlen = sizeof(attr->xdp_socket.ring_size);
+           break;
+        default:
+           return -PAL_ERROR_INVAL;
+           break;
+    }
+
+    int ret = ocall_setsockopt(handle->sock.fd, SOL_XDP, optname, optval, optlen);
+    if (ret < 0) {
+        return unix_to_pal_error(ret);
+    }
+
+    return ret;
+}
+
 static int attrsetbyhdl_udp(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) {
     assert(handle->sock.type == PAL_SOCKET_UDP);
 
     return attrsetbyhdl_common(handle, attr);
+}
+
+static int xdp_send(PAL_HANDLE handle, struct pal_iovec* pal_iov, size_t iov_len, size_t* out_size,
+                struct pal_socket_addr* addr) {
+    assert(PAL_GET_TYPE(handle) == PAL_TYPE_SOCKET);
+
+    ssize_t ret = ocall_send_xdp(handle->sock.fd);
+    if (ret < 0) {
+        return unix_to_pal_error(ret);
+    }
+    return 0;
 }
 
 static int send(PAL_HANDLE handle, struct pal_iovec* pal_iov, size_t iov_len, size_t* out_size,
@@ -546,6 +712,12 @@ static struct socket_ops g_udp_sock_ops = {
     .recv = recv,
 };
 
+static struct socket_ops g_xdp_sock_ops = {
+    .bind = bind,
+    .send = xdp_send,
+    .recv = recv,
+};
+
 static struct handle_ops g_tcp_handle_ops = {
     .attrquerybyhdl = attrquerybyhdl,
     .attrsetbyhdl = attrsetbyhdl_tcp,
@@ -557,6 +729,12 @@ static struct handle_ops g_udp_handle_ops = {
     .attrquerybyhdl = attrquerybyhdl,
     .attrsetbyhdl = attrsetbyhdl_udp,
     .delete = delete_udp,
+    .close = close,
+};
+
+static struct handle_ops g_xdp_handle_ops = {
+    .attrquerybyhdl = attrquerybyhdl_xdp,
+    .attrsetbyhdl = attrsetbyhdl_xdp,
     .close = close,
 };
 

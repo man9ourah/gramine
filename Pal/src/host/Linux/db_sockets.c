@@ -6,18 +6,23 @@
 #include <asm/ioctls.h>
 #include <asm/poll.h>
 #include <limits.h>
+#include <linux/bpf.h>
 #include <linux/time.h>
+#include <sys/mman.h>
 
 #include "pal.h"
 #include "pal_internal.h"
 #include "pal_linux.h"
 #include "pal_linux_error.h"
 #include "socket_utils.h"
+#include "toml_utils.h"
 
 static struct handle_ops g_tcp_handle_ops;
 static struct handle_ops g_udp_handle_ops;
+static struct handle_ops g_xdp_handle_ops;
 static struct socket_ops g_tcp_sock_ops;
 static struct socket_ops g_udp_sock_ops;
+static struct socket_ops g_xdp_sock_ops;
 
 static size_t g_default_recv_buf_size = 0;
 static size_t g_default_send_buf_size = 0;
@@ -37,6 +42,11 @@ static PAL_HANDLE create_sock_handle(int fd, enum pal_socket_domain domain,
     handle->sock.domain = domain;
     handle->sock.type = type;
     handle->sock.ops = ops;
+
+    // all of the next options does not apply to AF_XDP
+    if (handle->sock.domain == PAL_XDP) {
+        return handle;
+    }
 
     handle->sock.recv_buf_size = __atomic_load_n(&g_default_recv_buf_size, __ATOMIC_RELAXED);
     if (!handle->sock.recv_buf_size) {
@@ -90,6 +100,9 @@ int _DkSocketCreate(enum pal_socket_domain domain, enum pal_socket_type type,
         case PAL_IPV6:
             linux_domain = AF_INET6;
             break;
+        case PAL_XDP:
+            linux_domain = AF_XDP;
+            break;
         default:
             BUG();
     }
@@ -106,6 +119,15 @@ int _DkSocketCreate(enum pal_socket_domain domain, enum pal_socket_type type,
             handle_ops = &g_udp_handle_ops;
             sock_ops = &g_udp_sock_ops;
             break;
+        case PAL_SOCKET_RAW:
+            linux_type = SOCK_RAW;
+            if (domain == PAL_XDP) {
+                handle_ops = &g_xdp_handle_ops;
+                sock_ops = &g_xdp_sock_ops;
+                break;
+            }
+            // other than using xdp, SOCK_RAW is not supported yet!
+            // fall through
         default:
             BUG();
     }
@@ -149,6 +171,106 @@ static int do_getsockname(int fd, struct sockaddr_storage* sa_storage) {
     return unix_to_pal_error(ret);
 }
 
+// following two functions adopted from linux kernel
+static int recv_xsks_map_fd_from_ctrl_node(int ctrl_sock_fd){
+	char cms[CMSG_SPACE(sizeof(int))];
+	struct cmsghdr *cmsg;
+	struct msghdr msg;
+	struct iovec iov;
+	int value;
+	int len;
+
+	iov.iov_base = &value;
+	iov.iov_len = sizeof(int);
+
+	msg.msg_name = 0;
+	msg.msg_namelen = 0;
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_flags = 0;
+	msg.msg_control = (void*)cms;
+	msg.msg_controllen = sizeof(cms);
+
+	len = DO_SYSCALL(recvmsg, ctrl_sock_fd, &msg, 0);
+
+	if (len <= 0) {
+        return -PAL_ERROR_CONNFAILED_PIPE;
+	}
+
+	cmsg = CMSG_FIRSTHDR(&msg);
+	int fd = *(int *)CMSG_DATA(cmsg);
+
+	return fd;
+}
+
+static int recv_xsks_map_fd(char* ctrl_server_path){
+	struct sockaddr_un server;
+	int ctrl_sock_fd;
+
+	ctrl_sock_fd = DO_SYSCALL(socket, AF_UNIX, SOCK_STREAM, 0);
+	if (ctrl_sock_fd < 0) {
+		return -PAL_ERROR_NOTCONNECTION;
+	}
+
+    memset(&server, 0, sizeof(server));
+    server.sun_family = AF_UNIX;
+
+    int unix_server_path_len = strnlen(ctrl_server_path, sizeof(server.sun_path));
+    if(unix_server_path_len == sizeof(server.sun_path)){
+        return -PAL_ERROR_ADDRNOTEXIST;
+    }
+    memcpy(server.sun_path, ctrl_server_path, unix_server_path_len);
+
+	if (DO_SYSCALL(connect, ctrl_sock_fd, (struct sockaddr *)&server, sizeof(struct sockaddr_un))) {
+        DO_SYSCALL(close, ctrl_sock_fd);
+        return -PAL_ERROR_NOTCONNECTION;
+	}
+
+	return recv_xsks_map_fd_from_ctrl_node(ctrl_sock_fd);
+}
+
+static int xdp_update_bpf_xsk_map(PAL_HANDLE handle, uint32_t queue_id){
+    // first we need to get the xsk map from the control process.
+    // the user should have provide a unix socket addrees the control process
+    // is listening to; lets parse it
+    toml_table_t* manifest_root = g_pal_public_state.manifest_root;
+    assert(manifest_root);
+    toml_table_t* toml_sys_table = toml_table_in(manifest_root, "sys");
+    if (!toml_sys_table) {
+        return -PAL_ERROR_ADDRNOTEXIST;
+    }
+    toml_table_t* toml_net_table = toml_table_in(toml_sys_table, "net");
+    if (!toml_net_table) {
+        return -PAL_ERROR_ADDRNOTEXIST;
+    }
+    char* xdp_ctrl_server_path = NULL;
+    if (toml_string_in(toml_net_table, "xdp_ctrl_addr", &xdp_ctrl_server_path) < 0){
+        return -PAL_ERROR_ADDRNOTEXIST;
+    }
+
+    // now we attempt to connect to the ctrl process and get the bpf xsks map
+    int xsks_map_fd = recv_xsks_map_fd(xdp_ctrl_server_path);
+    if (xsks_map_fd < 0) {
+        return xsks_map_fd;
+    }
+
+    // we got the xsks map fd! now we insert our socket fd into the map
+    int sock_fd = handle->sock.fd;
+    union bpf_attr bpfattr;
+    memset(&bpfattr, 0, sizeof(bpfattr));
+    bpfattr.map_fd = xsks_map_fd;
+    bpfattr.key = (__u64)(unsigned long)(&queue_id);
+    bpfattr.value = (__u64)(unsigned long)(&sock_fd);
+    bpfattr.flags = 0;
+
+    int ret = DO_SYSCALL(bpf, BPF_MAP_UPDATE_ELEM, &bpfattr, sizeof(bpfattr));
+    if (ret < 0) {
+        return -PAL_ERROR_DENIED;
+    }
+
+    return 0;
+}
+
 static int bind(PAL_HANDLE handle, struct pal_socket_addr* addr) {
     assert(PAL_GET_TYPE(handle) == PAL_TYPE_SOCKET);
     if (addr->domain != handle->sock.domain) {
@@ -159,6 +281,7 @@ static int bind(PAL_HANDLE handle, struct pal_socket_addr* addr) {
         struct sockaddr_storage sa_storage;
         struct sockaddr_in addr_ipv4;
         struct sockaddr_in6 addr_ipv6;
+        struct sockaddr_xdp addr_xdp;
     } linux_addr;
     size_t linux_addrlen;
     pal_to_linux_sockaddr(addr, &linux_addr.sa_storage, &linux_addrlen);
@@ -192,6 +315,12 @@ static int bind(PAL_HANDLE handle, struct pal_socket_addr* addr) {
                 }
                 assert(linux_addr.addr_ipv6.sin6_family == AF_INET6);
                 addr->ipv6.port = linux_addr.addr_ipv6.sin6_port;
+            }
+            break;
+        case PAL_XDP:
+            ret = xdp_update_bpf_xsk_map(handle, addr->xdp.queue_id);
+            if (ret < 0) {
+                return ret;
             }
             break;
         default:
@@ -288,6 +417,83 @@ static int connect(PAL_HANDLE handle, struct pal_socket_addr* addr,
     }
     return 0;
 }
+
+/**
+ * this function calls the mmap syscall.. on success, it will write the mapped address
+ * to the passed addr params and return 0, otherwise return -1 for error.
+ */
+static int do_xdp_rings_mmap(void** addr, size_t size, int flags, int fd, off_t offset){
+    void* mapped_address = (void*)DO_SYSCALL(mmap, *addr, size, PROT_READ | PROT_WRITE, flags, fd, offset);
+    if (mapped_address != MAP_FAILED) {
+        *addr = mapped_address;
+        return 0;
+    }
+    return -1;
+}
+
+static int attrquerybyhdl_xdp(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) {
+    assert(PAL_GET_TYPE(handle) == PAL_TYPE_SOCKET);
+
+    switch (attr->xdp_socket.sockopt) {
+        case PAL_XDP_GETSOCKOPT_MMAP_OFFSETS:;
+            struct xdp_mmap_offsets xdp_off;
+            int len = sizeof(xdp_off);
+            int ret = DO_SYSCALL(getsockopt, handle->sock.fd, SOL_XDP, XDP_MMAP_OFFSETS, &xdp_off, &len);
+            if (ret < 0) {
+                return unix_to_pal_error(ret);
+            }
+            attr->xdp_socket.fill_producer     = xdp_off.fr.producer;
+            attr->xdp_socket.fill_consumer     = xdp_off.fr.consumer;
+            attr->xdp_socket.fill_desc         = xdp_off.fr.desc;
+            attr->xdp_socket.fill_flags        = xdp_off.fr.flags;
+            attr->xdp_socket.complete_producer = xdp_off.cr.producer;
+            attr->xdp_socket.complete_consumer = xdp_off.cr.consumer;
+            attr->xdp_socket.complete_desc     = xdp_off.cr.desc;
+            attr->xdp_socket.complete_flags    = xdp_off.cr.flags;
+            attr->xdp_socket.tx_producer       = xdp_off.tx.producer;
+            attr->xdp_socket.tx_consumer       = xdp_off.tx.consumer;
+            attr->xdp_socket.tx_desc           = xdp_off.tx.desc;
+            attr->xdp_socket.tx_flags          = xdp_off.tx.flags;
+            attr->xdp_socket.rx_producer       = xdp_off.rx.producer;
+            attr->xdp_socket.rx_consumer       = xdp_off.rx.consumer;
+            attr->xdp_socket.rx_desc           = xdp_off.rx.desc;
+            attr->xdp_socket.rx_flags          = xdp_off.rx.flags;
+            return ret;
+            break;
+
+        case PAL_XDP_MMAP_FILL_RING:
+            return do_xdp_rings_mmap(&attr->xdp_socket.untrusted_ring_mapping,
+                    attr->xdp_socket.ring_size, attr->xdp_socket.rings_mmap_flags,
+                    handle->sock.fd, XDP_UMEM_PGOFF_FILL_RING);
+            break;
+        case PAL_XDP_MMAP_COMP_RING:
+            return do_xdp_rings_mmap(&attr->xdp_socket.untrusted_ring_mapping,
+                    attr->xdp_socket.ring_size, attr->xdp_socket.rings_mmap_flags,
+                    handle->sock.fd, XDP_UMEM_PGOFF_COMPLETION_RING);
+            break;
+        case PAL_XDP_MMAP_TX_RING:
+            return do_xdp_rings_mmap(&attr->xdp_socket.untrusted_ring_mapping,
+                    attr->xdp_socket.ring_size, attr->xdp_socket.rings_mmap_flags,
+                    handle->sock.fd, XDP_PGOFF_TX_RING);
+            break;
+        case PAL_XDP_MMAP_RX_RING:
+            return do_xdp_rings_mmap(&attr->xdp_socket.untrusted_ring_mapping,
+                    attr->xdp_socket.ring_size, attr->xdp_socket.rings_mmap_flags,
+                    handle->sock.fd, XDP_PGOFF_RX_RING);
+            break;
+
+        // TODO: we dont need those for now (for xdp init I mean)
+        case PAL_XDP_GETSOCKOPT_OPTIONS:
+        case PAL_XDP_GETSOCKOPT_STATS:
+            return -PAL_ERROR_NOTIMPLEMENTED;
+            break;
+        default:
+            return -PAL_ERROR_INVAL;
+            break;
+    }
+
+    return -PAL_ERROR_INVAL;
+};
 
 static int attrquerybyhdl(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) {
     assert(PAL_GET_TYPE(handle) == PAL_TYPE_SOCKET);
@@ -475,6 +681,72 @@ static int attrsetbyhdl_udp(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) {
     return attrsetbyhdl_common(handle, attr);
 }
 
+static int attrsetbyhdl_xdp(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) {
+    assert(PAL_GET_TYPE(handle) == PAL_TYPE_SOCKET);
+    if (attr->handle_type != PAL_TYPE_SOCKET) {
+        return -PAL_ERROR_INVAL;
+    }
+
+    struct xdp_umem_reg mr;
+    int optname;
+    void* optval;
+    size_t optlen;
+
+    switch (attr->xdp_socket.sockopt) {
+        case PAL_XDP_SETSOCKOPT_UMEM_REG:;
+            mr.addr       = attr->xdp_socket.umem_addr;
+            mr.len        = attr->xdp_socket.umem_len;
+            mr.chunk_size = attr->xdp_socket.umem_chunk_size;
+            mr.headroom   = attr->xdp_socket.umem_chunk_headroom;
+            mr.flags      = attr->xdp_socket.umem_flags;
+            optname = XDP_UMEM_REG;
+            optval = &mr;
+            optlen = sizeof(mr);
+            break;
+        case PAL_XDP_SETSOCKOPT_FILL_RING:;
+            optname = XDP_UMEM_FILL_RING;
+            optval = &attr->xdp_socket.ring_size;
+            optlen = sizeof(attr->xdp_socket.ring_size);
+            break;
+        case PAL_XDP_SETSOCKOPT_COMP_RING:;
+            optname = XDP_UMEM_COMPLETION_RING;
+            optval = &attr->xdp_socket.ring_size;
+            optlen = sizeof(attr->xdp_socket.ring_size);
+            break;
+        case PAL_XDP_SETSOCKOPT_TX_RING:;
+            optname = XDP_TX_RING;
+            optval = &attr->xdp_socket.ring_size;
+            optlen = sizeof(attr->xdp_socket.ring_size);
+            break;
+        case PAL_XDP_SETSOCKOPT_RX_RING:;
+            optname = XDP_RX_RING;
+            optval = &attr->xdp_socket.ring_size;
+            optlen = sizeof(attr->xdp_socket.ring_size);
+            break;
+        default:
+            return -PAL_ERROR_INVAL;
+            break;
+    }
+
+    int ret = DO_SYSCALL(setsockopt, handle->sock.fd, SOL_XDP, optname, optval, optlen);
+    if (ret < 0) {
+        return unix_to_pal_error(ret);
+    }
+
+    return ret;
+}
+
+static int xdp_send(PAL_HANDLE handle, struct pal_iovec* pal_iov, size_t iov_len, size_t* out_size,
+                struct pal_socket_addr* addr) {
+    assert(PAL_GET_TYPE(handle) == PAL_TYPE_SOCKET);
+
+    int ret = DO_SYSCALL(sendto, handle->sock.fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+    if (ret < 0) {
+        return unix_to_pal_error(ret);
+    }
+    return 0;
+}
+
 static int send(PAL_HANDLE handle, struct pal_iovec* pal_iov, size_t iov_len, size_t* out_size,
                 struct pal_socket_addr* addr) {
     assert(PAL_GET_TYPE(handle) == PAL_TYPE_SOCKET);
@@ -594,6 +866,12 @@ static struct socket_ops g_udp_sock_ops = {
     .recv = recv,
 };
 
+static struct socket_ops g_xdp_sock_ops = {
+    .bind = bind,
+    .send = xdp_send,
+    .recv = recv,
+};
+
 static struct handle_ops g_tcp_handle_ops = {
     .attrquerybyhdl = attrquerybyhdl,
     .attrsetbyhdl = attrsetbyhdl_tcp,
@@ -605,6 +883,12 @@ static struct handle_ops g_udp_handle_ops = {
     .attrquerybyhdl = attrquerybyhdl,
     .attrsetbyhdl = attrsetbyhdl_udp,
     .delete = delete_udp,
+    .close = close,
+};
+
+static struct handle_ops g_xdp_handle_ops = {
+    .attrquerybyhdl = attrquerybyhdl_xdp,
+    .attrsetbyhdl = attrsetbyhdl_xdp,
     .close = close,
 };
 
