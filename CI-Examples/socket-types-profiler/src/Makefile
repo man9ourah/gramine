@@ -3,12 +3,13 @@ REPO_ROOT := $(shell git rev-parse --show-toplevel)
 LIBXDP_H := $(REPO_ROOT)/subprojects/xdp-tools-1.2.3/headers
 LIBXDP_L := $(REPO_ROOT)/subprojects/xdp-tools-1.2.3/lib/libxdp/libxdp.a
 LIBBPF_L := $(REPO_ROOT)/subprojects/xdp-tools-1.2.3/lib/libbpf/src/libbpf.a
+LIBBPF_H := $(REPO_ROOT)/subprojects/xdp-tools-1.2.3/lib/libbpf/src/root/usr/include
 
 CC=clang
 CFLAGS=-O3 -std=gnu11
 LDFLAGS=-L$(dir $(LIBXDP_L)) -L$(dir $(LIBBPF_L))
 LDLIBS=-l:libxdp.a -l:libbpf.a -lz -lelf
-INC=-I$(LIBXDP_H)
+INC=-I$(LIBXDP_H) -I$(LIBBPF_H)
 LOG_LEVEL=error
 
 COMMON_FILES=perf-common perf-xdp-common
@@ -41,6 +42,9 @@ clean:
 check_libs:
 	@( test -d "$(LIBXDP_H)" && test -s "$(LIBXDP_L)" && test -s "$(LIBBPF_L)" ) \
 		|| ( echo "\n[!] Make sure is Gramine is built first with -Dxdp=enabled\n" && exit 1 )
+
+perf-xdp-loader:
+	$(CC) $(CFLAGS) $(LDFLAGS) $(INC) $@.c -o $@ $(LDLIBS)
 
 perf-server: $(SERVER_SRC) $(SERVER_HDR) $(COMMON_SRC) $(COMMON_HDR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(INC) $(SERVER_SRC) $(COMMON_SRC) -o $@ $(LDLIBS)
