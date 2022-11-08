@@ -12,7 +12,6 @@ sys.net.xdp_ctrl_addr = "/tmp/{{ perf_prog }}-xdp-ctrl"
 
 fs.mounts = [
   { path = "/lib", uri = "file:{{ gramine.runtimedir() }}" },
-  { path = "/usr/lib", uri = "file:/usr/lib"},
   { path = "/usr/{{ arch_libdir }}", uri = "file:/usr/{{ arch_libdir }}"},
   { path = "{{ arch_libdir }}", uri = "file:{{ arch_libdir }}"},
 ]
@@ -24,7 +23,6 @@ sgx.trusted_files = [
   "file:{{ gramine.libos }}",
   "file:{{ perf_prog }}",
   "file:{{ gramine.runtimedir() }}/",
-  "file:/usr/lib/",
   "file:/usr/{{ arch_libdir }}/",
   "file:{{ arch_libdir }}/",
 ]
