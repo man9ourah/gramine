@@ -11,7 +11,7 @@ print_msg (){
 }
 
 usage() {
-    print_msg "Usage: $0 [-r <none|direct|sgx>] [-n <RESULT_RAW_NAME>] [-i <RETRIES=10>] [-v] -- PERF_CLIENT_ARGS"
+    print_msg "Usage: $0 [-r <none|direct|sgx>] [-n <RESULT_RAW_NAME>] [-i <RETRIES=5>] [-v] -- PERF_CLIENT_ARGS"
     exit 1
 }
 
