@@ -101,7 +101,7 @@ void memset32_htonl(void* dest, uint32_t val, uint32_t size) { /*{{{*/
  */
 void parse_command_line(int argc, char** argv) { /*{{{*/
     int opt;
-    while ((opt = getopt(argc, argv, "c:b:s:o:d:U:u:I:P:M:i:p:m:f:q:lr:t:x:")) != -1) {
+    while ((opt = getopt(argc, argv, "c:b:s:o:d:U:u:I:P:M:i:p:m:f:q:lzr:t:x:")) != -1) {
         switch (opt) {
             case 'c':
                 arg_iteration_count = atoi(optarg);
