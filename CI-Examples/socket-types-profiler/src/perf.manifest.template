@@ -6,7 +6,8 @@ loader.insecure__use_cmdline_argv = true
 loader.env.LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}:/usr{{ arch_libdir }}"
 loader.pal_internal_mem_size = "64M"
 
-sys.net.veth1 = 2
+sys.net.ens3f0 = 3
+sys.net.ens3f1 = 5
 sys.net.xdp_ctrl_addr = "/tmp/{{ perf_prog }}-xdp-ctrl"
 
 fs.mounts = [
