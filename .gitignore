@@ -48,3 +48,7 @@ TAGS
 cscope.*
 ncscope.*
 *cscope*
+
+# LSP files
+.cache/
+compile_commands.json
