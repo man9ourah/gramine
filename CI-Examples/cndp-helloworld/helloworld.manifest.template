@@ -1,0 +1,27 @@
+libos.entrypoint = "helloworld"
+
+loader.entrypoint = "file:{{ gramine.libos }}"
+loader.log_level = "{{ log_level }}"
+loader.insecure__use_cmdline_argv = true
+loader.env.LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}:/usr{{ arch_libdir }}"
+loader.pal_internal_mem_size = "64M"
+
+sys.net.ens3f0 = 3
+sys.net.ens3f1 = 5
+
+fs.mounts = [
+  { path = "/lib", uri = "file:{{ gramine.runtimedir() }}" },
+  { path = "/usr/{{ arch_libdir }}", uri = "file:/usr/{{ arch_libdir }}"},
+  { path = "{{ arch_libdir }}", uri = "file:{{ arch_libdir }}"},
+]
+
+sgx.debug = true
+sgx.nonpie_binary = true
+
+sgx.trusted_files = [
+  "file:{{ gramine.libos }}",
+  "file:helloworld",
+  "file:{{ gramine.runtimedir() }}/",
+  "file:/usr/{{ arch_libdir }}/",
+  "file:{{ arch_libdir }}/",
+]
